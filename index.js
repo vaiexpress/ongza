@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
+const { SSMClient, GetParametersCommand } = require('@aws-sdk/client-ssm');
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -9,20 +11,70 @@ const PORT = process.env.PORT || 4000;
 app.use(cors());
 app.use(express.json());
 
-const pool = process.env.DB_URL
-  ? mysql.createPool({
+async function loadSecretsFromSSM() {
+  const names = (process.env.SSM_PARAMS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!names.length) return;
+
+  const client = new SSMClient({ region: process.env.AWS_REGION || 'ap-southeast-1' });
+  const cmd = new GetParametersCommand({ Names: names, WithDecryption: true });
+  const { Parameters = [], InvalidParameters = [] } = await client.send(cmd);
+
+  Parameters.forEach((p) => {
+    const key = p.Name.split('/').pop();
+    process.env[key] = p.Value;
+  });
+
+  if (InvalidParameters.length) {
+    console.warn('SSM missing params:', InvalidParameters);
+  }
+  console.log(`Loaded ${Parameters.length} secrets from SSM`);
+}
+
+async function loadSecretsFromSecretsManager() {
+  const secretId = process.env.SECRETS_MANAGER_SECRET_ID;
+  if (!secretId) return;
+
+  const client = new SecretsManagerClient({ region: process.env.AWS_REGION || 'ap-southeast-1' });
+  const cmd = new GetSecretValueCommand({ SecretId: secretId });
+  const resp = await client.send(cmd);
+
+  const payload = resp.SecretString
+    ? resp.SecretString
+    : Buffer.from(resp.SecretBinary || '', 'base64').toString('utf8');
+
+  try {
+    const obj = JSON.parse(payload);
+    Object.entries(obj).forEach(([k, v]) => {
+      if (typeof v === 'string') process.env[k] = v;
+    });
+    console.log(`Loaded secrets from Secrets Manager: ${secretId}`);
+  } catch (err) {
+    console.warn('Secrets Manager payload is not JSON, skipping parse');
+  }
+}
+
+function createPool() {
+  if (process.env.DB_URL) {
+    return mysql.createPool({
       uri: process.env.DB_URL,
       waitForConnections: true,
       connectionLimit: 10,
-    })
-  : mysql.createPool({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'root',
-      password: process.env.DB_PASS || '',
-      database: process.env.DB_NAME || 'vaiexpress',
-      waitForConnections: true,
-      connectionLimit: 10,
     });
+  }
+  return mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASS || '',
+    database: process.env.DB_NAME || 'vaiexpress',
+    waitForConnections: true,
+    connectionLimit: 10,
+  });
+}
+
+let pool;
 
 async function getBaseRate() {
   const [rows] = await pool.query('SELECT exchange_rate FROM settings WHERE id = 1');
@@ -60,18 +112,19 @@ function computeTotals(payload, baseRate) {
   };
 }
 
-app.get('/', (req, res) => {
-  res.send('VAIexpress Node service is running.');
-});
+function createRouter() {
+  app.get('/', (req, res) => {
+    res.send('VAIexpress Node service is running.');
+  });
 
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', db: 'connected' });
-  } catch (err) {
-    res.status(500).json({ status: 'error', message: err.message });
-  }
-});
+  app.get('/health', async (req, res) => {
+    try {
+      await pool.query('SELECT 1');
+      res.json({ status: 'ok', db: 'connected' });
+    } catch (err) {
+      res.status(500).json({ status: 'error', message: err.message });
+    }
+  });
 
 app.get('/api/stats/summary', async (req, res) => {
   try {
@@ -266,7 +319,25 @@ app.delete('/api/orders/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+}
 
-app.listen(PORT, () => {
-  console.log(`VAIexpress API listening on http://localhost:${PORT}`);
+async function start() {
+  try {
+    await loadSecretsFromSSM();
+    await loadSecretsFromSecretsManager();
+  } catch (err) {
+    console.warn('Secret load skipped/failed:', err.message);
+  }
+
+  pool = createPool();
+  createRouter();
+
+  app.listen(PORT, () => {
+    console.log(`VAIexpress API listening on http://localhost:${PORT}`);
+  });
+}
+
+start().catch((err) => {
+  console.error('Fatal start error:', err);
+  process.exit(1);
 });
